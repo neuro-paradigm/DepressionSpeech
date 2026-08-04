@@ -21,6 +21,7 @@ const {
 } = require('../services/mlService');
 const { buildSpectrogramFromWav } = require('../services/spectrogramService');
 const { createZip, extractZipEntries } = require('../services/zipService');
+const { runDiarization } = require('../services/diarizationService');
 
 function sanitizeFolderSegment(value = 'participant') {
   return String(value)
@@ -260,12 +261,79 @@ async function buildProgressiveAudioZip(submission, currentAudio) {
     })),
   };
 
+  // ── Speaker diarization (offline, no API) ───────────────────────────────
+  // Run diarization on the most recently uploaded recording so each saved
+  // audio gets its own speaker1/speaker2 breakdown inside the ZIP.
+  // Failures are fully isolated: a warning is logged and the ZIP is built
+  // without the diarization folder, leaving all other files untouched.
+  const diarizationFiles = [];
+  if (currentAudio?.questionId && currentAudio?.buffer) {
+    try {
+      const diarizationResult = await runDiarization(
+        currentAudio.buffer,
+        currentAudio.questionId,
+      );
+
+      if (diarizationResult) {
+        const prefix = `diarization/${currentAudio.questionId}`;
+
+        diarizationFiles.push(
+          { name: `${prefix}/speaker1.wav`,              content: diarizationResult.speaker1.wav },
+          { name: `${prefix}/speaker1.txt`,              content: diarizationResult.speaker1.txt },
+          { name: `${prefix}/speaker2.wav`,              content: diarizationResult.speaker2.wav },
+          { name: `${prefix}/speaker2.txt`,              content: diarizationResult.speaker2.txt },
+        );
+
+        if (diarizationResult.speaker1.spectrogram) {
+          diarizationFiles.push({ name: `${prefix}/speaker1_spectrogram.png`, content: diarizationResult.speaker1.spectrogram });
+        }
+        if (diarizationResult.speaker2.spectrogram) {
+          diarizationFiles.push({ name: `${prefix}/speaker2_spectrogram.png`, content: diarizationResult.speaker2.spectrogram });
+        }
+
+        // Add a small metadata JSON so consumers know diarization ran
+        diarizationFiles.push({
+          name: `${prefix}/diarization_info.json`,
+          content: Buffer.from(JSON.stringify({
+            generatedAt: new Date().toISOString(),
+            questionId: currentAudio.questionId,
+            ...diarizationResult.meta,
+          }, null, 2), 'utf8'),
+        });
+
+        console.log(`[diarize] Added ${diarizationFiles.length} diarization files for ${currentAudio.questionId}`);
+      }
+    } catch (diarizationError) {
+      // Never crash the pipeline — log and move on
+      console.warn(`[diarize] Skipped diarization for ${currentAudio.questionId}:`, diarizationError.message);
+    }
+  }
+  // ── End diarization ──────────────────────────────────────────────────────
+
+  // Update manifest to reference diarization files if they were generated
+  if (diarizationFiles.length) {
+    const prefix = `diarization/${currentAudio.questionId}`;
+    const manifestEntry = manifest.entries.find((e) => e.questionId === currentAudio.questionId);
+    if (manifestEntry) {
+      manifestEntry.diarization = {
+        speaker1Wav:         `${prefix}/speaker1.wav`,
+        speaker1Txt:         `${prefix}/speaker1.txt`,
+        speaker1Spectrogram: `${prefix}/speaker1_spectrogram.png`,
+        speaker2Wav:         `${prefix}/speaker2.wav`,
+        speaker2Txt:         `${prefix}/speaker2.txt`,
+        speaker2Spectrogram: `${prefix}/speaker2_spectrogram.png`,
+        info:                `${prefix}/diarization_info.json`,
+      };
+    }
+  }
+
   const files = [
     { name: 'manifest.json', content: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8') },
     ...audioFiles,
     ...transcriptFiles,
     ...spectrogramFiles,
     ...spectrogramErrorFiles,
+    ...diarizationFiles,
   ];
 
   const audioCount = audioFiles.length;
