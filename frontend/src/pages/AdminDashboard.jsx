@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Eye, Mic, RefreshCw, Sparkles } from 'lucide-react';
+import { Eye, Fingerprint, Mic, RefreshCw, Sparkles } from 'lucide-react';
 import { api } from '../api/client';
 
 function displayClassification(value) {
@@ -12,11 +12,12 @@ function displayClassification(value) {
 
 export default function AdminDashboard() {
   const navigate = useNavigate();
-  const [submissions, setSubmissions] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [generatingId, setGeneratingId] = useState('');
-  const [error, setError] = useState('');
-  const [success, setSuccess] = useState('');
+  const [submissions, setSubmissions]         = useState([]);
+  const [loading, setLoading]                 = useState(true);
+  const [generatingId, setGeneratingId]       = useState('');
+  const [error, setError]                     = useState('');
+  const [success, setSuccess]                 = useState('');
+  const [doctorEnrolled, setDoctorEnrolled]   = useState(null);
 
   // Modal states for action gating
   const [modalOpen, setModalOpen] = useState(false);
@@ -44,6 +45,15 @@ export default function AdminDashboard() {
     }
   }
 
+  async function fetchEnrollmentStatus() {
+    try {
+      const { data } = await api.get('/doctor-enrollment-status');
+      setDoctorEnrolled(data.enrolled);
+    } catch {
+      setDoctorEnrolled(false);
+    }
+  }
+
   async function generateReport(submissionId) {
     setGeneratingId(submissionId);
     setError('');
@@ -64,6 +74,7 @@ export default function AdminDashboard() {
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     loadSubmissions();
+    fetchEnrollmentStatus();
   }, []);
 
   function getReportSummary(report) {
@@ -99,6 +110,33 @@ export default function AdminDashboard() {
           </button>
         </div>
       </header>
+
+      {/* Doctor enrollment status banner */}
+      {doctorEnrolled !== null && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: '12px',
+          padding: '12px 20px', borderRadius: '8px', margin: '0 0 8px 0',
+          background: doctorEnrolled ? '#f0fdf4' : '#fefce8',
+          border: `1px solid ${doctorEnrolled ? '#bbf7d0' : '#fde68a'}`,
+          flexWrap: 'wrap',
+        }}>
+          <Fingerprint size={20} style={{ color: doctorEnrolled ? '#16a34a' : '#ca8a04', flexShrink: 0 }} />
+          <span style={{ flex: 1, fontSize: '13px', color: doctorEnrolled ? '#166534' : '#854d0e' }}>
+            {doctorEnrolled
+              ? 'Doctor voice registered — consultations will be automatically labeled Doctor / Patient.'
+              : 'Doctor voice not registered — recordings will use generic Speaker 1 / Speaker 2 labels.'}
+          </span>
+          <button
+            className="secondary"
+            type="button"
+            onClick={() => navigate('/enroll')}
+            style={{ fontSize: '13px', padding: '6px 14px', borderColor: doctorEnrolled ? '#bbf7d0' : '#fde68a' }}
+          >
+            <Fingerprint size={14} />
+            {doctorEnrolled ? 'Manage Registration' : 'Register Doctor Voice'}
+          </button>
+        </div>
+      )}
 
 
 

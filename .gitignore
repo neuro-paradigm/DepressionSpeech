@@ -84,3 +84,6 @@ desktop.ini
 !*/package-lock.json
 !yarn.lock
 !pnpm-lock.yaml
+
+# Doctor voice enrollment data (stored locally, not committed to source control)
+backend/doctor_profile/

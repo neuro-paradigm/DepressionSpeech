@@ -15,6 +15,9 @@ const {
   getReport,
   getAdminUsers,
   getMySubmissions,
+  enrollDoctor,
+  enrollmentStatus,
+  clearEnrollment,
 } = require('../controllers/submissionController');
 
 const router = express.Router();
@@ -33,4 +36,10 @@ router.get('/get-report/:id', requireAuth, getReport);
 router.get('/my-submissions', requireAuth, getMySubmissions);
 router.get('/admin/users', requireAuth, requireAdmin, getAdminUsers);
 
+// Doctor Voice Enrollment
+router.post('/enroll-doctor-voice', requireAuth, requireAdmin, uploadMemory.single('audio'), enrollDoctor);
+router.get('/doctor-enrollment-status', requireAuth, requireAdmin, enrollmentStatus);
+router.delete('/doctor-enrollment', requireAuth, requireAdmin, clearEnrollment);
+
 module.exports = router;
+

@@ -22,6 +22,11 @@ const {
 const { buildSpectrogramFromWav } = require('../services/spectrogramService');
 const { createZip, extractZipEntries } = require('../services/zipService');
 const { runDiarization } = require('../services/diarizationService');
+const {
+  enrollDoctorVoice,
+  getDoctorEnrollmentStatus: getEnrollmentStatus,
+  clearDoctorEnrollment,
+} = require('../services/enrollmentService');
 
 function sanitizeFolderSegment(value = 'participant') {
   return String(value)
@@ -275,33 +280,43 @@ async function buildProgressiveAudioZip(submission, currentAudio) {
       );
 
       if (diarizationResult) {
-        const prefix = `diarization/${currentAudio.questionId}`;
+        const prefix  = `diarization/${currentAudio.questionId}`;
+        const useDr   = diarizationResult.useDoctorLabels === true;
+
+        // Choose file names: doctor/patient when identified, else speaker1/speaker2
+        const spk1Key  = useDr ? 'doctor'   : 'speaker1';
+        const spk2Key  = useDr ? 'patient'  : 'speaker2';
+        const spk1Spec = useDr ? 'doctor_spectrogram'  : 'speaker1_spectrogram';
+        const spk2Spec = useDr ? 'patient_spectrogram' : 'speaker2_spectrogram';
 
         diarizationFiles.push(
-          { name: `${prefix}/speaker1.wav`,              content: diarizationResult.speaker1.wav },
-          { name: `${prefix}/speaker1.txt`,              content: diarizationResult.speaker1.txt },
-          { name: `${prefix}/speaker2.wav`,              content: diarizationResult.speaker2.wav },
-          { name: `${prefix}/speaker2.txt`,              content: diarizationResult.speaker2.txt },
+          { name: `${prefix}/${spk1Key}.wav`, content: diarizationResult.speaker1.wav },
+          { name: `${prefix}/${spk1Key}.txt`, content: diarizationResult.speaker1.txt },
+          { name: `${prefix}/${spk2Key}.wav`, content: diarizationResult.speaker2.wav },
+          { name: `${prefix}/${spk2Key}.txt`, content: diarizationResult.speaker2.txt },
         );
 
         if (diarizationResult.speaker1.spectrogram) {
-          diarizationFiles.push({ name: `${prefix}/speaker1_spectrogram.png`, content: diarizationResult.speaker1.spectrogram });
+          diarizationFiles.push({ name: `${prefix}/${spk1Spec}.png`, content: diarizationResult.speaker1.spectrogram });
         }
         if (diarizationResult.speaker2.spectrogram) {
-          diarizationFiles.push({ name: `${prefix}/speaker2_spectrogram.png`, content: diarizationResult.speaker2.spectrogram });
+          diarizationFiles.push({ name: `${prefix}/${spk2Spec}.png`, content: diarizationResult.speaker2.spectrogram });
         }
 
-        // Add a small metadata JSON so consumers know diarization ran
+        // Diarization metadata JSON
         diarizationFiles.push({
           name: `${prefix}/diarization_info.json`,
           content: Buffer.from(JSON.stringify({
-            generatedAt: new Date().toISOString(),
-            questionId: currentAudio.questionId,
+            generatedAt:            new Date().toISOString(),
+            questionId:             currentAudio.questionId,
+            useDoctorLabels:        useDr,
+            doctorIdentification:   diarizationResult.doctorIdentification,
             ...diarizationResult.meta,
           }, null, 2), 'utf8'),
         });
 
-        console.log(`[diarize] Added ${diarizationFiles.length} diarization files for ${currentAudio.questionId}`);
+        console.log(`[diarize] Added ${diarizationFiles.length} diarization files for ${currentAudio.questionId}` +
+          (useDr ? ' [doctor/patient labels]' : ' [generic labels]'));
       }
     } catch (diarizationError) {
       // Never crash the pipeline — log and move on
@@ -312,17 +327,24 @@ async function buildProgressiveAudioZip(submission, currentAudio) {
 
   // Update manifest to reference diarization files if they were generated
   if (diarizationFiles.length) {
-    const prefix = `diarization/${currentAudio.questionId}`;
+    const prefix     = `diarization/${currentAudio.questionId}`;
+    const useDr      = diarizationFiles.some((f) => f.name.includes('/doctor.'));
+    const spk1Key    = useDr ? 'doctor'   : 'speaker1';
+    const spk2Key    = useDr ? 'patient'  : 'speaker2';
+    const spk1Spec   = useDr ? 'doctor_spectrogram'  : 'speaker1_spectrogram';
+    const spk2Spec   = useDr ? 'patient_spectrogram' : 'speaker2_spectrogram';
+
     const manifestEntry = manifest.entries.find((e) => e.questionId === currentAudio.questionId);
     if (manifestEntry) {
       manifestEntry.diarization = {
-        speaker1Wav:         `${prefix}/speaker1.wav`,
-        speaker1Txt:         `${prefix}/speaker1.txt`,
-        speaker1Spectrogram: `${prefix}/speaker1_spectrogram.png`,
-        speaker2Wav:         `${prefix}/speaker2.wav`,
-        speaker2Txt:         `${prefix}/speaker2.txt`,
-        speaker2Spectrogram: `${prefix}/speaker2_spectrogram.png`,
-        info:                `${prefix}/diarization_info.json`,
+        [`${spk1Key}Wav`]:         `${prefix}/${spk1Key}.wav`,
+        [`${spk1Key}Txt`]:         `${prefix}/${spk1Key}.txt`,
+        [`${spk1Key}Spectrogram`]: `${prefix}/${spk1Spec}.png`,
+        [`${spk2Key}Wav`]:         `${prefix}/${spk2Key}.wav`,
+        [`${spk2Key}Txt`]:         `${prefix}/${spk2Key}.txt`,
+        [`${spk2Key}Spectrogram`]: `${prefix}/${spk2Spec}.png`,
+        info:                      `${prefix}/diarization_info.json`,
+        useDoctorLabels:           useDr,
       };
     }
   }
@@ -618,6 +640,52 @@ async function submitData(req, res, next) {
   }
 }
 
+// ── Doctor Voice Enrollment endpoints ────────────────────────────────────────
+
+async function enrollDoctor(req, res, next) {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'Audio file is required for enrollment.' });
+    }
+    const isWav = req.file.mimetype?.includes('wav') || req.file.originalname?.toLowerCase().endsWith('.wav');
+    if (!isWav) {
+      return res.status(400).json({ message: 'Doctor enrollment audio must be a WAV file.' });
+    }
+
+    const result = await enrollDoctorVoice(req.file.buffer);
+    res.json({
+      message:         'Doctor voice enrolled successfully.',
+      durationSec:     result.durationSec,
+      embeddingMethod: result.embeddingMethod,
+      embeddingShape:  result.embeddingShape,
+    });
+  } catch (error) {
+    console.error('[enroll] Enrollment failed:', error.message);
+    next(error);
+  }
+}
+
+async function enrollmentStatus(req, res, next) {
+  try {
+    const status = getEnrollmentStatus();
+    res.json({
+      enrolled:    status.enrolled,
+      hasReference: Boolean(status.referenceWavPath),
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function clearEnrollment(req, res, next) {
+  try {
+    clearDoctorEnrollment();
+    res.json({ message: 'Doctor enrollment cleared. The doctor can now re-register.' });
+  } catch (error) {
+    next(error);
+  }
+}
+
 async function generateReport(req, res, next) {
   try {
     const { sessionId, submissionId } = req.body;
@@ -734,4 +802,7 @@ module.exports = {
   getReport,
   getAdminUsers,
   getMySubmissions,
+  enrollDoctor,
+  enrollmentStatus,
+  clearEnrollment,
 };

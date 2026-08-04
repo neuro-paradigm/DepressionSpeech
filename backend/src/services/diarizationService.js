@@ -15,6 +15,7 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { getDoctorEnrollmentStatus } = require('./enrollmentService');
 
 /**
  * Absolute path to the Python diarization script.
@@ -46,15 +47,20 @@ function pythonExecutable() {
  * @returns {Promise<object>} Parsed JSON result from the Python script.
  */
 function spawnDiarize(audioPath, outDir, opts = {}) {
-  const whisperModel = opts.whisperModel || 'tiny';
+  const whisperModel      = opts.whisperModel || 'tiny';
+  const referenceEmbedding = opts.referenceEmbedding || null;
 
   return new Promise((resolve, reject) => {
     const args = [
       DIARIZE_SCRIPT,
-      '--audio', audioPath,
-      '--outdir', outDir,
+      '--audio',         audioPath,
+      '--outdir',        outDir,
       '--whisper-model', whisperModel,
     ];
+
+    if (referenceEmbedding) {
+      args.push('--reference-embedding', referenceEmbedding);
+    }
 
     const python = execFile(
       pythonExecutable(),
@@ -141,49 +147,76 @@ async function runDiarization(wavBuffer, label = 'audio', opts = {}) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `diarize-${label}-`));
   const inputWav = path.join(tempDir, 'input.wav');
 
+  // Check if a doctor embedding is enrolled — pass it to diarize.py if so
+  const { enrolled, embeddingPath } = getDoctorEnrollmentStatus();
+
   try {
     // Write the WAV buffer to a temp file so Python can read it
     fs.writeFileSync(inputWav, wavBuffer);
 
-    console.log(`[diarize] Starting diarization for "${label}" (${Math.round(wavBuffer.length / 1024)} KB)`);
+    console.log(`[diarize] Starting diarization for "${label}" (${Math.round(wavBuffer.length / 1024)} KB)` +
+      (enrolled ? ' [doctor reference active]' : ' [no doctor reference]'));
 
-    const result = await spawnDiarize(inputWav, tempDir, opts);
+    const result = await spawnDiarize(inputWav, tempDir, {
+      ...opts,
+      referenceEmbedding: enrolled ? embeddingPath : null,
+    });
 
     console.log(
       `[diarize] Done — ${result.totalDuration}s audio, ${result.segmentCount} segments. ` +
-      `Speaker 1: ${result.speaker1?.durationSec}s, Speaker 2: ${result.speaker2?.durationSec}s`
+      `${result.speaker1?.label ?? 'Speaker 1'}: ${result.speaker1?.durationSec}s, ` +
+      `${result.speaker2?.label ?? 'Speaker 2'}: ${result.speaker2?.durationSec}s` +
+      (result.useDoctorLabels ? ' [doctor identified]' : '')
     );
 
-    // Read back the 6 output files
-    const spk1Wav = readFileSafe(result.speaker1?.wav);
-    const spk1Txt = readFileSafe(result.speaker1?.txt);
-    const spk1Png = readFileSafe(result.speaker1?.spectrogram);
-    const spk2Wav = readFileSafe(result.speaker2?.wav);
-    const spk2Txt = readFileSafe(result.speaker2?.txt);
-    const spk2Png = readFileSafe(result.speaker2?.spectrogram);
+    // Read back output files — use doctor/patient names when available
+    const useDoctorLabels = result.useDoctorLabels === true;
+
+    const spk1WavPath  = result.speaker1?.wav;
+    const spk1TxtPath  = result.speaker1?.txt;
+    const spk1PngPath  = result.speaker1?.spectrogram;
+    const spk2WavPath  = result.speaker2?.wav;
+    const spk2TxtPath  = result.speaker2?.txt;
+    const spk2PngPath  = result.speaker2?.spectrogram;
+
+    const spk1Wav = readFileSafe(spk1WavPath);
+    const spk1Txt = readFileSafe(spk1TxtPath);
+    const spk1Png = readFileSafe(spk1PngPath);
+    const spk2Wav = readFileSafe(spk2WavPath);
+    const spk2Txt = readFileSafe(spk2TxtPath);
+    const spk2Png = readFileSafe(spk2PngPath);
 
     if (!spk1Wav || !spk2Wav) {
       throw new Error('Diarization completed but speaker WAV files are missing');
     }
 
+    const spk1Label = result.speaker1?.label  ?? 'speaker1';
+    const spk2Label = result.speaker2?.label  ?? 'speaker2';
+
     return {
+      useDoctorLabels,
+      doctorIdentification: result.doctorIdentification ?? null,
+      // speaker1 is always the "primary" (longer) speaker — doctor when enrolled
       speaker1: {
-        wav: spk1Wav,
-        txt: spk1Txt || Buffer.from('(No transcript available.)', 'utf8'),
+        label:       spk1Label,
+        wav:         spk1Wav,
+        txt:         spk1Txt || Buffer.from('(No transcript available.)', 'utf8'),
         spectrogram: spk1Png,
       },
+      // speaker2 is the secondary — patient when enrolled
       speaker2: {
-        wav: spk2Wav,
-        txt: spk2Txt || Buffer.from('(No transcript available.)', 'utf8'),
+        label:       spk2Label,
+        wav:         spk2Wav,
+        txt:         spk2Txt || Buffer.from('(No transcript available.)', 'utf8'),
         spectrogram: spk2Png,
       },
       meta: {
-        totalDuration: result.totalDuration,
-        segmentCount: result.segmentCount,
-        speaker1Segments: result.speaker1?.segments,
-        speaker2Segments: result.speaker2?.segments,
+        totalDuration:    result.totalDuration,
+        segmentCount:     result.segmentCount,
         speaker1Duration: result.speaker1?.durationSec,
         speaker2Duration: result.speaker2?.durationSec,
+        doctorEnrolled:   enrolled,
+        useDoctorLabels,
       },
     };
   } catch (error) {

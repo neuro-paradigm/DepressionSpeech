@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { NavLink, Route, Routes, Navigate } from 'react-router-dom';
-import { LogOut, Mic, ShieldCheck } from 'lucide-react';
+import { Fingerprint, LogOut, Mic, ShieldCheck } from 'lucide-react';
 import AdminDashboard from './pages/AdminDashboard';
 import AuthPage from './pages/AuthPage';
+import DoctorEnrollment from './pages/DoctorEnrollment';
 import ReportView from './pages/ReportView';
 import UserDashboard from './pages/UserDashboard';
 import './styles.css';
@@ -38,6 +39,10 @@ export default function App() {
             <Mic size={18} />
             Record Patient
           </NavLink>
+          <NavLink to="/enroll" className={({ isActive }) => isActive ? 'active' : ''}>
+            <Fingerprint size={18} />
+            Doctor Voice
+          </NavLink>
           <button className="secondary nav-user" type="button" onClick={logout}>
             <LogOut size={18} />
             {currentUser.name}
@@ -46,8 +51,9 @@ export default function App() {
       </nav>
 
       <Routes>
-        <Route path="/admin" element={<AdminDashboard />} />
+        <Route path="/admin"  element={<AdminDashboard />} />
         <Route path="/record" element={<UserDashboard currentUser={currentUser} />} />
+        <Route path="/enroll" element={<DoctorEnrollment />} />
         <Route path="/report/:id" element={<ReportView />} />
         <Route path="*" element={<Navigate to="/admin" replace />} />
       </Routes>
