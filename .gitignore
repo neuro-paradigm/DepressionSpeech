@@ -87,3 +87,24 @@ desktop.ini
 
 # Doctor voice enrollment data (stored locally, not committed to source control)
 backend/doctor_profile/
+
+# Python bytecode and caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Machine Learning models, weights, and binary artifacts
+*.pkl
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.onnx
+*.h5
+*.tflite
+backend/inference/models/
+models/
+
+#others
+BioClinDown.ipynb

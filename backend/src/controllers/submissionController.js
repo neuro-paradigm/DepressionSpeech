@@ -22,6 +22,7 @@ const {
 const { buildSpectrogramFromWav } = require('../services/spectrogramService');
 const { createZip, extractZipEntries } = require('../services/zipService');
 const { runDiarization } = require('../services/diarizationService');
+const { predictFusion } = require('../services/fusionService');
 const {
   enrollDoctorVoice,
   getDoctorEnrollmentStatus: getEnrollmentStatus,
@@ -272,7 +273,7 @@ async function buildProgressiveAudioZip(submission, currentAudio) {
   // Failures are fully isolated: a warning is logged and the ZIP is built
   // without the diarization folder, leaving all other files untouched.
   const diarizationFiles = [];
-  if (currentAudio?.questionId && currentAudio?.buffer) {
+  if (currentAudio?.questionId === 'session' && currentAudio?.buffer) {
     try {
       const diarizationResult = await runDiarization(
         currentAudio.buffer,
@@ -702,6 +703,19 @@ async function generateReport(req, res, next) {
 
     await restoreMissingSpectrogramsFromDriveZip(submission);
     submission.report = buildReport(submission);
+    try {
+      submission.report.fusionPrediction = await predictFusion(submission);
+      submission.report.fusionAvailable = true;
+      submission.report.fusionUnavailableReason = undefined;
+      submission.report.fusionDataFormatLimitations = submission.report.fusionPrediction.data_format_limitations || [];
+    } catch (fusionError) {
+      console.warn('Fusion inference unavailable:', fusionError.message);
+      submission.report.fusionAvailable = false;
+      submission.report.fusionUnavailableReason = fusionError.message;
+      submission.report.fusionDataFormatLimitations = [
+        'The fusion model was not available when this report was generated.',
+      ];
+    }
     submission.status = 'report-generated';
     const structuredSubmission = buildStructuredSubmissionJson(submission);
     submission.zipFileUrl = undefined;
@@ -737,7 +751,15 @@ async function getReport(req, res, next) {
     const responseHasSpectrogram = Array.from(submission.responses || []).some(([, response]) => response?.spectrogram?.data);
     const reportNeedsSpectrogram = responseHasSpectrogram && !submission.report?.spectrogram?.data;
     if (restoredSpectrograms || reportNeedsSpectrogram) {
+      const savedFusion = submission.report?.fusionPrediction;
+      const savedFusionAvailable = submission.report?.fusionAvailable;
+      const savedFusionReason = submission.report?.fusionUnavailableReason;
+      const savedFusionLimitations = submission.report?.fusionDataFormatLimitations;
       submission.report = buildReport(submission);
+      submission.report.fusionPrediction = savedFusion;
+      submission.report.fusionAvailable = savedFusionAvailable;
+      submission.report.fusionUnavailableReason = savedFusionReason;
+      submission.report.fusionDataFormatLimitations = savedFusionLimitations;
       await submission.save();
     }
 

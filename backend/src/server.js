@@ -7,6 +7,7 @@ const cors = require('cors');
 const connectDatabase = require('./config/db');
 const submissionRoutes = require('./routes/submissionRoutes');
 const authRoutes = require('./routes/authRoutes');
+const { getFusionHealth } = require('./services/fusionService');
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -20,7 +21,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use('/api/auth', authRoutes);
 app.use('/api', submissionRoutes);
 
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
   res.json({
     status: 'ok',
     service: 'Speech Analysis API',
@@ -31,6 +32,7 @@ app.get('/health', (req, res) => {
     ),
     googleOAuthConfigured: Boolean(process.env.GOOGLE_OAUTH_CLIENT_ID && process.env.GOOGLE_OAUTH_CLIENT_SECRET),
     googleOAuthAuthorized: Boolean(process.env.GOOGLE_DRIVE_REFRESH_TOKEN),
+    fusion: await getFusionHealth(),
   });
 });
 

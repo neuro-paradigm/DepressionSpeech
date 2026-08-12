@@ -68,6 +68,10 @@ const reportSchema = new mongoose.Schema(
       mongoose.Schema.Types.Mixed,
     ],
     structuredSubmission: mongoose.Schema.Types.Mixed,
+    fusionPrediction: mongoose.Schema.Types.Mixed,
+    fusionAvailable: Boolean,
+    fusionUnavailableReason: String,
+    fusionDataFormatLimitations: [String],
     generatedAt: {
       type: Date,
       default: Date.now,

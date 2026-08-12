@@ -139,6 +139,7 @@ export default function ReportCard({
   const savedSpectrogram = report.spectrogram?.data
     ? report.spectrogram
     : primarySpectrogramResponse?.spectrogram;
+  const fusion = report.fusionPrediction;
 
   return (
     <article className="report clinical-report">
@@ -163,6 +164,22 @@ export default function ReportCard({
           <p className="overall-impression">{report.finalSummary}</p>
         </section>
       )}
+
+      <section className="report-section fusion-analysis">
+        <h2>Deep Learning Fusion Analysis</h2>
+        {report.fusionAvailable && fusion ? (
+          <>
+            <div className="fusion-metrics">
+              <div><span>PHQ-8 estimate</span><strong>{Number(fusion.phq8_est).toFixed(1)} / 24</strong></div>
+              <div><span>Audio model</span><strong>{(Number(fusion.schnet_prob) * 100).toFixed(1)}%</strong></div>
+              <div><span>Text model</span><strong>{(Number(fusion.ling_prob) * 100).toFixed(1)}%</strong></div>
+              <div><span>Fusion result</span><strong>{(Number(fusion.fusion_prob) * 100).toFixed(1)}% — {fusion.classification}</strong></div>
+            </div>
+            <p className="inline-status">Youden threshold: {Number(fusion.threshold_used).toFixed(3)}. This result is research-only and requires professional interpretation.</p>
+          </>
+        ) : <p className="inline-status">Fusion analysis unavailable: {report.fusionUnavailableReason || 'The local inference service has not completed startup.'}</p>}
+        {(report.fusionDataFormatLimitations || fusion?.data_format_limitations || []).map((note) => <p className="fusion-note" key={note}>{note}</p>)}
+      </section>
 
       <section className="report-section">
         <h2>Linguistic Biomarker Summary</h2>

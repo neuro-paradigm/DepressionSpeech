@@ -284,24 +284,23 @@ export default function UserDashboard({ currentUser }) {
 
       const newSavedResponses = { ...savedResponses, [currentQuestion.id]: response.data.response };
       setSavedResponses(newSavedResponses);
-      setAudioBlob(null);
-      setTranscript('');
-      setRecordingStopped(false);
-      setDurationMs(0);
-      
       const driveError = response.data.progressiveZipError || response.data.submission?.progressiveZipUploadError;
       if (driveError) {
-        setStatus('Saved locally, but Drive upload failed.');
+        setStatus('Saved locally, but Drive upload failed. You can click Save again to retry.');
         setError(`Google Drive upload failed: ${driveError}`);
       } else {
         setStatus('Saved successfully');
-      }
+        setAudioBlob(null);
+        setTranscript('');
+        setRecordingStopped(false);
+        setDurationMs(0);
 
-      if (Object.keys(newSavedResponses).length === voiceQuestions.length) {
-        setShowCompletionModal(true);
-      } else {
-        const nextIndex = Math.min(stepIndex + 1, voiceQuestions.length - 1);
-        if (nextIndex !== stepIndex) setStepIndex(nextIndex);
+        if (Object.keys(newSavedResponses).length === voiceQuestions.length) {
+          setShowCompletionModal(true);
+        } else {
+          const nextIndex = Math.min(stepIndex + 1, voiceQuestions.length - 1);
+          if (nextIndex !== stepIndex) setStepIndex(nextIndex);
+        }
       }
     } catch (requestError) {
       console.error('Save response error:', requestError);
@@ -334,15 +333,16 @@ export default function UserDashboard({ currentUser }) {
 
       const response = await api.post('/upload-voice-response', payload);
       setSavedResponses({ session: response.data.response });
-      setAudioBlob(null);
-      setRecordingStopped(false);
-      setDurationMs(0);
       const driveError = response.data.progressiveZipError || response.data.submission?.progressiveZipUploadError;
       if (driveError) {
-        setStatus('Session saved locally, but Drive upload failed.');
+        setStatus('Session saved locally, but Drive upload failed. You can click Save again to retry.');
         setError(`Google Drive upload failed: ${driveError}`);
       } else {
         setStatus('Entire session saved successfully. Audio and transcript were added to the Drive ZIP.');
+        setAudioBlob(null);
+        setRecordingStopped(false);
+        setDurationMs(0);
+        setShowCompletionModal(true);
       }
     } catch (requestError) {
       console.error('Save session error:', requestError);
@@ -457,6 +457,35 @@ export default function UserDashboard({ currentUser }) {
             {loadingAction === 'save-session' ? 'Saving...' : 'Save Session'}
           </button>
         </div>
+
+        {showCompletionModal && (
+          <div className="modal-overlay">
+            <div className="modal-content text-center">
+              <div style={{ display: 'inline-flex', padding: '16px', background: '#e9f8ef', borderRadius: '50%', color: '#166534', marginBottom: '16px' }}>
+                <CheckCircle2 size={40} />
+              </div>
+              <h2>Recording Complete!</h2>
+              <p>
+                Thank you. The session recording has been successfully saved.<br />
+                <strong>Please hand this device back to the doctor.</strong>
+              </p>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                <button className="primary" type="button" onClick={() => navigate('/admin')} style={{ justifyContent: 'center' }}>
+                  Go to Dashboard
+                </button>
+                <button className="secondary" type="button" onClick={() => {
+                  setShowCompletionModal(false);
+                  startNewPatient();
+                }} style={{ justifyContent: 'center' }}>
+                  Record Another Patient
+                </button>
+                <button className="text-button" type="button" onClick={() => setShowCompletionModal(false)} style={{ color: '#5b6778', fontSize: '13px' }}>
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </main>
     );
   }

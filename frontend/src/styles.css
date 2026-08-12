@@ -811,6 +811,30 @@ td {
   padding: 22px 0 0;
 }
 
+.fusion-metrics {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-top: 14px;
+}
+
+.fusion-metrics div {
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+}
+
+.fusion-metrics span,
+.fusion-note {
+  color: #405064;
+  font-size: 13px;
+}
+
+.fusion-note { margin: 8px 0 0; }
+
 .insight-list {
   display: grid;
   gap: 12px;
@@ -1087,6 +1111,7 @@ td {
   .field-grid,
   .report-grid,
   .clinical-summary,
+  .fusion-metrics,
   .transcript-columns,
   .response-analysis-grid,
   .feature-grid {
