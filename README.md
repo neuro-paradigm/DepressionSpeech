@@ -148,6 +148,9 @@ python generate_guide.py
 |-------------------------|------------------------------------------|---------------------------------------------|
 | `VITE_API_URL`          | Backend API base URL                     | `http://localhost:5000/api`                 |
 | `VITE_GOOGLE_CLIENT_ID` | Google OAuth client ID (for SSO button) | `*.apps.googleusercontent.com`              |
+| `VITE_DOCTOR_ACCESS_CODE` | Access code required before viewing/generating reports | `123456`                     |
+
+> Note: the frontend access code is a convenience gate only (frontend code is public by nature). All privileged API routes remain protected by JWT auth on the backend.
 
 ---
 

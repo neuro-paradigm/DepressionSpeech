@@ -1,14 +1,37 @@
-import { useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { CheckCircle2, CircleStop, ClipboardList, Mic, MessagesSquare, RotateCcw, Save, UserPlus } from 'lucide-react';
+import {
+  BookOpenText,
+  CheckCircle2,
+  CircleStop,
+  ClipboardList,
+  Mic,
+  MessagesSquare,
+  RotateCcw,
+  Save,
+  UserPlus,
+} from 'lucide-react';
 import { api } from '../api/client';
 import { voiceQuestions } from '../data/voiceQuestions';
+import { convertRecordingToWav } from '../utils/wav';
+import { formatClock } from '../utils/display';
+import { setUnsavedWorkActive } from '../utils/unsavedWork';
+import { KaraokeReader } from '../components/ReadingHighlighter';
+import useObjectUrl from '../hooks/useObjectUrl';
+import useUnsavedGuard from '../hooks/useUnsavedGuard';
+
+const EMOTION_TONES = {
+  Calm: 'calm',
+  Anger: 'anger',
+  Fear: 'fear',
+  Happiness: 'happiness',
+};
 
 function makeSessionId(doctorId) {
-  return `session-${doctorId}-${Date.now()}`;
+  return `session-${doctorId ?? 'anon'}-${Date.now()}`;
 }
 
-function createSpeechRecognizer({ onText, onError, onEnd }) {
+function createSpeechRecognizer({ onText, onResult, onError, onEnd }) {
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SpeechRecognition) return null;
   const recognizer = new SpeechRecognition();
@@ -26,6 +49,9 @@ function createSpeechRecognizer({ onText, onError, onEnd }) {
       if (result.isFinal) committedTranscript = `${committedTranscript} ${text}`.trim();
       else interimTranscript = `${interimTranscript} ${text}`.trim();
     }
+    // One recognizer feeds two consumers: the saved transcript and the
+    // voice-driven read-along highlighter.
+    onResult?.({ final: committedTranscript, interim: interimTranscript });
     onText(`${committedTranscript} ${interimTranscript}`.trim());
   };
   recognizer.onerror = (event) => onError?.(event.error);
@@ -33,72 +59,19 @@ function createSpeechRecognizer({ onText, onError, onEnd }) {
   return recognizer;
 }
 
-function writeString(view, offset, text) {
-  for (let index = 0; index < text.length; index += 1) {
-    view.setUint8(offset + index, text.charCodeAt(index));
-  }
-}
-
-function audioBufferToWav(audioBuffer) {
-  const channelCount = audioBuffer.numberOfChannels;
-  const sampleRate = audioBuffer.sampleRate;
-  const sampleCount = audioBuffer.length;
-  const bytesPerSample = 2;
-  const blockAlign = channelCount * bytesPerSample;
-  const dataSize = sampleCount * blockAlign;
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buffer);
-
-  writeString(view, 0, 'RIFF');
-  view.setUint32(4, 36 + dataSize, true);
-  writeString(view, 8, 'WAVE');
-  writeString(view, 12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, channelCount, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * blockAlign, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, 16, true);
-  writeString(view, 36, 'data');
-  view.setUint32(40, dataSize, true);
-
-  let offset = 44;
-  const channels = Array.from({ length: channelCount }, (_, index) => audioBuffer.getChannelData(index));
-  for (let sampleIndex = 0; sampleIndex < sampleCount; sampleIndex += 1) {
-    for (let channelIndex = 0; channelIndex < channelCount; channelIndex += 1) {
-      const sample = Math.max(-1, Math.min(1, channels[channelIndex][sampleIndex]));
-      view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
-      offset += bytesPerSample;
-    }
-  }
-
-  return buffer;
-}
-
-async function convertRecordingToWav(recordedBlob) {
-  const AudioContext = window.AudioContext || window.webkitAudioContext;
-  if (!AudioContext) throw new Error('This browser cannot convert recordings to WAV.');
-
-  const audioContext = new AudioContext();
-  try {
-    const sourceBuffer = await recordedBlob.arrayBuffer();
-    const decodedAudio = await audioContext.decodeAudioData(sourceBuffer.slice(0));
-    return new Blob([audioBufferToWav(decodedAudio)], { type: 'audio/wav' });
-  } finally {
-    await audioContext.close?.();
-  }
-}
-
 export default function UserDashboard({ currentUser }) {
   const navigate = useNavigate();
   const [sessionId, setSessionId] = useState(() => makeSessionId(currentUser?.id));
   const mediaRecorderRef = useRef(null);
+  const streamRef = useRef(null);
   const speechRecognizerRef = useRef(null);
   const keepRecognitionAliveRef = useRef(false);
   const recognitionRestartTimerRef = useRef(null);
   const chunksRef = useRef([]);
   const recordingStartedAtRef = useRef(null);
+  // Guards against the async recorder.onstop landing after the user has
+  // already switched question / started a new patient (mis-filed audio).
+  const captureTokenRef = useRef(0);
 
   const [durationMs, setDurationMs] = useState(0);
   const [stepIndex, setStepIndex] = useState(0);
@@ -113,16 +86,67 @@ export default function UserDashboard({ currentUser }) {
   const [error, setError] = useState('');
   const [showCompletionModal, setShowCompletionModal] = useState(false);
   const [recordingMode, setRecordingMode] = useState('');
+  const [elapsedSec, setElapsedSec] = useState(0);
+  const [readingEpoch, setReadingEpoch] = useState(0);
+  // Live recognizer output, consumed by the read-along highlighter.
+  const [spoken, setSpoken] = useState({ final: '', interim: '' });
+
+  const speechSupported = useMemo(
+    () => Boolean(window.SpeechRecognition || window.webkitSpeechRecognition),
+    [],
+  );
 
   const currentQuestion = voiceQuestions[stepIndex];
   const hasAllResponses = Object.keys(savedResponses).length === voiceQuestions.length;
   const currentQuestionSaved = savedResponses[currentQuestion?.id];
+  const audioPreviewUrl = useObjectUrl(audioBlob);
+
+  // Anything recorded but not yet saved to the server counts as unsaved work:
+  // an active recording, a converted take waiting to be saved, or a live
+  // transcript that only exists in this browser.
+  const hasUnsavedWork = Boolean(isRecording || audioBlob || transcript.trim());
+
+  // Warn before closing/refreshing the tab and before any in-app navigation.
+  useUnsavedGuard({
+    active: hasUnsavedWork,
+    message: 'A recording is in progress or has not been saved yet. Leaving now will discard it. Leave anyway?',
+  });
+
+  // Let the app shell (sign-out button) know about unsaved work too.
+  useEffect(() => {
+    setUnsavedWorkActive(hasUnsavedWork);
+    return () => setUnsavedWorkActive(false);
+  }, [hasUnsavedWork]);
+
+  function confirmDiscard() {
+    return !hasUnsavedWork
+      || window.confirm('Discard the current unsaved recording?');
+  }
+
+  // Live elapsed-time ticker while recording.
+  useEffect(() => {
+    if (!isRecording) return undefined;
+    const timer = setInterval(() => {
+      setElapsedSec(recordingStartedAtRef.current ? Math.floor((Date.now() - recordingStartedAtRef.current) / 1000) : 0);
+    }, 500);
+    return () => clearInterval(timer);
+  }, [isRecording]);
+
+  // Stop microphone + recognition when leaving the page entirely.
+  useEffect(() => () => {
+    captureTokenRef.current += 1;
+    keepRecognitionAliveRef.current = false;
+    clearTimeout(recognitionRestartTimerRef.current);
+    try { speechRecognizerRef.current?.stop(); } catch { /* already stopped */ }
+    try { mediaRecorderRef.current?.state !== 'inactive' && mediaRecorderRef.current?.stop(); } catch { /* already stopped */ }
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+  }, []);
 
   function stopSpeechRecognition() {
     keepRecognitionAliveRef.current = false;
     clearTimeout(recognitionRestartTimerRef.current);
     recognitionRestartTimerRef.current = null;
-    speechRecognizerRef.current?.stop();
+    try { speechRecognizerRef.current?.stop(); } catch { /* already stopped */ }
   }
 
   function restartSpeechRecognition(recognizer) {
@@ -132,35 +156,42 @@ export default function UserDashboard({ currentUser }) {
       if (!keepRecognitionAliveRef.current) return;
       try {
         recognizer.start();
-      } catch (error) {
-        if (error.name === 'InvalidStateError') return;
+      } catch (startError) {
+        if (startError.name === 'InvalidStateError') return;
         recognitionRestartTimerRef.current = setTimeout(() => restartSpeechRecognition(recognizer), 300);
       }
     }, 150);
   }
 
   function resetRecordingState() {
+    captureTokenRef.current += 1;
     if (isRecording) {
       mediaRecorderRef.current?.stop();
       stopSpeechRecognition();
       setIsRecording(false);
     }
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
 
     setAudioBlob(null);
     setRecordingStopped(false);
     setTranscript('');
     setDurationMs(0);
+    setElapsedSec(0);
+    setSpoken({ final: '', interim: '' });
     setError('');
     setStatus('');
   }
 
   function selectStep(index) {
     if (index === stepIndex) return;
+    if (!confirmDiscard()) return;
     resetRecordingState();
     setStepIndex(index);
   }
 
   function returnToModeChoice() {
+    if (!confirmDiscard()) return;
     resetRecordingState();
     setRecordingMode('');
   }
@@ -171,29 +202,45 @@ export default function UserDashboard({ currentUser }) {
       return;
     }
 
+    captureTokenRef.current += 1;
     setError('');
     setStatus('');
     setAudioBlob(null);
     setRecordingStopped(false);
     setTranscript('');
+    setDurationMs(0);
+    setReadingEpoch((epoch) => epoch + 1);
+    setSpoken({ final: '', interim: '' });
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
       chunksRef.current = [];
       const recorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
+
       recorder.ondataavailable = (event) => {
         if (event.data.size > 0) chunksRef.current.push(event.data);
       };
       recorder.onstop = async () => {
+        // The token captured at record-start must still be current, otherwise
+        // this stop belongs to an abandoned question/patient — discard it.
+        const token = captureTokenRef.current;
         const recordedBlob = new Blob(chunksRef.current, { type: recorder.mimeType || 'audio/webm' });
-        setDurationMs(recordingStartedAtRef.current ? Date.now() - recordingStartedAtRef.current : 0);
+        const elapsed = recordingStartedAtRef.current ? Date.now() - recordingStartedAtRef.current : 0;
         stream.getTracks().forEach((track) => track.stop());
+        if (streamRef.current === stream) streamRef.current = null;
+        if (token !== captureTokenRef.current) return;
+
+        setDurationMs(elapsed);
         try {
-          setStatus('Preparing WAV audio...');
+          setStatus('Preparing WAV audio…');
           const wavBlob = await convertRecordingToWav(recordedBlob);
+          if (token !== captureTokenRef.current) return;
           setAudioBlob(wavBlob);
           setStatus('Recording converted to WAV. Ready to save.');
         } catch (conversionError) {
+          if (token !== captureTokenRef.current) return;
           setAudioBlob(null);
           setError(conversionError.message || 'Unable to convert this recording to WAV. Please re-record.');
           setStatus('');
@@ -201,10 +248,10 @@ export default function UserDashboard({ currentUser }) {
       };
       recorder.start();
       recordingStartedAtRef.current = Date.now();
-      mediaRecorderRef.current = recorder;
 
       const recognizer = createSpeechRecognizer({
         onText: setTranscript,
+        onResult: setSpoken,
         onError: (recognitionError) => {
           if (recognitionError === 'no-speech' || recognitionError === 'aborted') return;
           if (recognitionError === 'not-allowed' || recognitionError === 'service-not-allowed') {
@@ -223,6 +270,8 @@ export default function UserDashboard({ currentUser }) {
       }
       setIsRecording(true);
     } catch (recordingError) {
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
       setError(recordingError.message || 'Microphone permission was denied.');
     }
   }
@@ -238,24 +287,20 @@ export default function UserDashboard({ currentUser }) {
     setAudioBlob(null);
     setTranscript('');
     setDurationMs(0);
+    setElapsedSec(0);
     setRecordingStopped(false);
+    setSpoken({ final: '', interim: '' });
     setError('');
     setStatus('');
   }
 
   function startNewPatient() {
-    mediaRecorderRef.current?.stop();
-    stopSpeechRecognition();
+    if (!confirmDiscard()) return;
+    resetRecordingState();
     setSessionId(makeSessionId(currentUser?.id));
     setPatient({ name: '', contact: '' });
     setStepIndex(0);
     setSavedResponses({});
-    setAudioBlob(null);
-    setRecordingStopped(false);
-    setTranscript('');
-    setDurationMs(0);
-    setStatus('');
-    setError('');
     setShowCompletionModal(false);
   }
 
@@ -304,7 +349,7 @@ export default function UserDashboard({ currentUser }) {
       }
     } catch (requestError) {
       console.error('Save response error:', requestError);
-      setError('Failed to save');
+      setError(requestError.response?.data?.message || 'Failed to save');
     } finally {
       setLoadingAction('');
     }
@@ -352,6 +397,136 @@ export default function UserDashboard({ currentUser }) {
     }
   }
 
+  function renderRecorderControls(saveLabel, loadingKey, onSave) {
+    return (
+      <>
+        <section className="form-panel recorder-panel">
+          <div className="panel-heading">
+            <h2>
+              {recordingMode === 'session'
+                ? 'Session Recorder'
+                : currentQuestion.isEmotionReading ? 'Emotion Reading' : `Question ${stepIndex + 1}`}
+            </h2>
+            <p>
+              {recordingMode === 'session'
+                ? 'Record the entire clinical session in one continuous audio file.'
+                : 'Read the prompt aloud at a natural pace. The reading guide highlights each word as you go.'}
+            </p>
+          </div>
+
+          {recordingMode !== 'session' && !currentQuestion.isEmotionReading && (
+            <div className="prompt-card">
+              <BookOpenText size={20} className="prompt-card-icon" />
+              <div className="prompt-card-body">
+                <KaraokeReader
+                  key={`prompt-${currentQuestion.id}-${readingEpoch}`}
+                  lines={[{ id: currentQuestion.id, text: currentQuestion.text }]}
+                  playing={isRecording}
+                  speech={spoken}
+                  voiceSupported={speechSupported}
+                  compact
+                />
+              </div>
+            </div>
+          )}
+
+          {recordingMode !== 'session' && currentQuestion.isEmotionReading && (
+            <div className="prompt-card">
+              <div className="prompt-card-body">
+                <p className="prompt-card-title">Read the following sentences with their emotion:</p>
+                <KaraokeReader
+                  key={`emotion-${currentQuestion.id}-${readingEpoch}`}
+                  lines={currentQuestion.emotions.map((group) => ({
+                    id: group.emotion,
+                    label: group.emotion,
+                    tone: EMOTION_TONES[group.emotion] || 'calm',
+                    text: group.sentence,
+                  }))}
+                  playing={isRecording}
+                  speech={spoken}
+                  voiceSupported={speechSupported}
+                />
+              </div>
+            </div>
+          )}
+
+          {(isRecording || recordingStopped) && (
+            <div className={`timer-chip ${isRecording ? 'recording' : 'done'}`}>
+              {isRecording && <span className="recording-dot active" />}
+              <span className="timer-value">{formatClock(isRecording ? elapsedSec : Math.round(durationMs / 1000))}</span>
+              <span className="timer-note">
+                {isRecording
+                  ? (recordingMode !== 'session' && elapsedSec < 60 ? `${60 - elapsedSec}s until 1 minute` : 'Recording…')
+                  : 'Recorded'}
+              </span>
+            </div>
+          )}
+
+          <div className="recorder-controls">
+            {!isRecording ? (
+              <button className={recordingStopped ? 'secondary disabled-look' : 'primary'} type="button" onClick={startRecording} disabled={recordingStopped}>
+                <Mic size={18} />
+                {recordingStopped ? 'Re-record to Start' : recordingMode === 'qa' && currentQuestionSaved ? 'Record Again' : 'Start Recording'}
+              </button>
+            ) : (
+              <button type="button" onClick={stopRecording}>
+                <CircleStop size={18} />
+                Stop Recording
+              </button>
+            )}
+            {recordingStopped && (
+              <button className="secondary" type="button" onClick={rerecord}>
+                <RotateCcw size={18} />
+                Re-record
+              </button>
+            )}
+            <span className={isRecording ? 'recording-dot active' : 'recording-dot'} />
+          </div>
+
+          {recordingMode === 'qa' && currentQuestionSaved && !audioBlob && !isRecording && !recordingStopped && (
+            <div className="saved-response-info">
+              <p className="success">This question has been saved.</p>
+              {currentQuestionSaved.transcripts?.raw && (
+                <div className="transcript-panel">
+                  <span>Saved transcript</span>
+                  <p>{currentQuestionSaved.transcripts.raw}</p>
+                </div>
+              )}
+              <p className="inline-status">You can record again to replace this response.</p>
+            </div>
+          )}
+
+          {audioPreviewUrl && (
+            <div className="audio-preview">
+              <span>Review your recording</span>
+              <audio controls src={audioPreviewUrl} />
+            </div>
+          )}
+
+          <div className="transcript-panel live-transcript-block">
+            <span>Live transcript</span>
+            <p>{transcript || 'Transcript will appear here when browser speech recognition is available.'}</p>
+          </div>
+
+          {audioBlob && <p className="inline-status">Recording is ready to save.</p>}
+        </section>
+
+        {status && <p className="success">{status}</p>}
+        {error && <p className="error">{error}</p>}
+
+        <div className="action-row">
+          <button className="secondary" type="button" onClick={returnToModeChoice}>
+            Back
+          </button>
+          <button type="button" onClick={onSave} disabled={loadingAction !== '' || !audioBlob}>
+            <Save size={18} />
+            {loadingAction === loadingKey ? 'Saving…' : saveLabel}
+          </button>
+        </div>
+      </>
+    );
+  }
+
   if (!recordingMode) {
     return (
       <main className="page">
@@ -367,12 +542,12 @@ export default function UserDashboard({ currentUser }) {
           <button className="mode-option" type="button" onClick={() => setRecordingMode('session')}>
             <ClipboardList size={28} />
             <strong>Record Entire Session</strong>
-            <span>Capture one continuous patient session with a live transcript.</span>
+            <span>Capture one continuous patient session with a live transcript and speaker diarization.</span>
           </button>
           <button className="mode-option" type="button" onClick={() => setRecordingMode('qa')}>
             <MessagesSquare size={28} />
             <strong>Question and Answer</strong>
-            <span>Use the existing four-question recording workflow.</span>
+            <span>Use the guided four-question workflow with a word-by-word reading guide.</span>
           </button>
         </section>
       </main>
@@ -389,9 +564,6 @@ export default function UserDashboard({ currentUser }) {
             <p>Capture the full appointment audio and live transcript in one saved record.</p>
           </div>
           <div className="header-actions">
-            <button className="secondary" type="button" onClick={returnToModeChoice}>
-              Back
-            </button>
             <button className="secondary" type="button" onClick={startNewPatient}>
               <UserPlus size={18} />
               New Session
@@ -410,81 +582,19 @@ export default function UserDashboard({ currentUser }) {
           </label>
         </section>
 
-        <section className="form-panel recorder-panel">
-          <div className="panel-heading">
-            <h2>Session Recorder</h2>
-            <p>Record the entire clinical session in one continuous audio file.</p>
-          </div>
-
-          <div className="recorder-controls">
-            {!isRecording ? (
-              <button className={recordingStopped ? 'secondary disabled-look' : 'primary'} type="button" onClick={startRecording} disabled={recordingStopped}>
-                <Mic size={18} />
-                Start Recording
-              </button>
-            ) : (
-              <button type="button" onClick={stopRecording}>
-                <CircleStop size={18} />
-                Stop Recording
-              </button>
-            )}
-            {recordingStopped && (
-              <button className="secondary" type="button" onClick={rerecord}>
-                <RotateCcw size={18} />
-                Re-record
-              </button>
-            )}
-            <span className={isRecording ? 'recording-dot active' : 'recording-dot'} />
-          </div>
-
-          <div className="transcript-panel live-transcript-block">
-            <span>Live transcript</span>
-            <p>{transcript || 'Transcript will appear here when browser speech recognition is available.'}</p>
-          </div>
-
-          {audioBlob && <p className="inline-status">Session recording is ready to save.</p>}
-        </section>
-
-        {status && <p className="success">{status}</p>}
-        {error && <p className="error">{error}</p>}
-
-        <div className="action-row">
-          <button className="secondary" type="button" onClick={returnToModeChoice}>
-            Back
-          </button>
-          <button type="button" onClick={saveEntireSession} disabled={loadingAction !== '' || !audioBlob}>
-            <Save size={18} />
-            {loadingAction === 'save-session' ? 'Saving...' : 'Save Session'}
-          </button>
-        </div>
+        {renderRecorderControls('Save Session', 'save-session', saveEntireSession)}
 
         {showCompletionModal && (
-          <div className="modal-overlay">
-            <div className="modal-content text-center">
-              <div style={{ display: 'inline-flex', padding: '16px', background: '#e9f8ef', borderRadius: '50%', color: '#166534', marginBottom: '16px' }}>
-                <CheckCircle2 size={40} />
-              </div>
-              <h2>Recording Complete!</h2>
-              <p>
-                Thank you. The session recording has been successfully saved.<br />
-                <strong>Please hand this device back to the doctor.</strong>
-              </p>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                <button className="primary" type="button" onClick={() => navigate('/admin')} style={{ justifyContent: 'center' }}>
-                  Go to Dashboard
-                </button>
-                <button className="secondary" type="button" onClick={() => {
-                  setShowCompletionModal(false);
-                  startNewPatient();
-                }} style={{ justifyContent: 'center' }}>
-                  Record Another Patient
-                </button>
-                <button className="text-button" type="button" onClick={() => setShowCompletionModal(false)} style={{ color: '#5b6778', fontSize: '13px' }}>
-                  Close
-                </button>
-              </div>
-            </div>
-          </div>
+          <CompletionModal
+            title="Recording Complete!"
+            body="The session recording has been successfully saved."
+            onClose={() => setShowCompletionModal(false)}
+            onAnother={() => {
+              setShowCompletionModal(false);
+              startNewPatient();
+            }}
+            navigate={navigate}
+          />
         )}
       </main>
     );
@@ -499,9 +609,6 @@ export default function UserDashboard({ currentUser }) {
           <p>Record patient voice prompts. Reports are generated later from the doctor dashboard.</p>
         </div>
         <div className="header-actions">
-          <button className="secondary" type="button" onClick={returnToModeChoice}>
-            Back
-          </button>
           <button className="secondary" type="button" onClick={startNewPatient}>
             <UserPlus size={18} />
             New Patient
@@ -520,7 +627,7 @@ export default function UserDashboard({ currentUser }) {
         </label>
       </section>
 
-      <div className={voiceQuestions.length === 3 ? "stepper three" : "stepper"}>
+      <div className="stepper">
         {voiceQuestions.map((question, index) => (
           <button
             key={question.id}
@@ -528,113 +635,22 @@ export default function UserDashboard({ currentUser }) {
             type="button"
             onClick={() => selectStep(index)}
           >
-            {index + 1}
-            <span>{`Q${index + 1} status: ${savedResponses[question.id] ? 'saved' : 'pending'}`}</span>
+            <strong>{index + 1}</strong>
+            <span>{savedResponses[question.id] ? 'Saved' : 'Pending'}</span>
           </button>
         ))}
       </div>
 
-      <section className="form-panel recorder-panel">
-        <div className="panel-heading">
-          <h2>{currentQuestion.isEmotionReading ? 'Emotion Reading' : `Question ${stepIndex + 1}`}</h2>
-          {currentQuestion.isEmotionReading ? (
-            <div style={{ marginTop: '12px' }}>
-              <p style={{ fontWeight: 'bold', fontSize: '16px', marginBottom: '16px', color: '#1e293b' }}>
-                Read the following sentences with their emotion:
-              </p>
-              <div style={{ display: 'grid', gap: '16px' }}>
-                {currentQuestion.emotions.map((group) => (
-                  <div key={group.emotion} style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '8px', padding: '14px' }}>
-                    <span className="eyebrow" style={{ 
-                      color: group.emotion === 'Calm' ? '#0f766e' : 
-                             group.emotion === 'Anger' ? '#be123c' : 
-                             group.emotion === 'Fear' ? '#c2410c' : '#047857', 
-                      display: 'block', 
-                      marginBottom: '8px',
-                      fontWeight: '800'
-                    }}>
-                      {group.emotion}
-                    </span>
-                    <p style={{ margin: 0, color: '#334155', lineHeight: '1.6', fontSize: '14px' }}>{group.sentence}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : (
-            <>
-              <p style={{ fontSize: '16px', color: '#1e293b', marginBottom: '8px' }}>{currentQuestion.text}</p>
-              <p style={{ fontStyle: 'italic', color: '#0f766e', fontWeight: '600', margin: '4px 0 0 0', fontSize: '13px' }}>
-                * Please speak for at least 1 minute.
-              </p>
-            </>
-          )}
-        </div>
-
-        {currentQuestionSaved && !audioBlob && !isRecording && (
-          <div className="saved-response-info">
-            <p className="success">This question has been saved.</p>
-            {currentQuestionSaved.transcripts?.raw && (
-              <div className="transcript-panel">
-                <span>Saved transcript</span>
-                <p>{currentQuestionSaved.transcripts.raw}</p>
-              </div>
-            )}
-            <p className="inline-status">You can re-record to replace this response.</p>
-          </div>
-        )}
-
-        <div className="recorder-controls">
-          {!isRecording ? (
-            <button className={recordingStopped ? 'secondary disabled-look' : 'primary'} type="button" onClick={startRecording} disabled={recordingStopped}>
-              <Mic size={18} />
-              {currentQuestionSaved && !recordingStopped ? 'Re-record' : 'Start Recording'}
-            </button>
-          ) : (
-            <button type="button" onClick={stopRecording}>
-              <CircleStop size={18} />
-              Stop Recording
-            </button>
-          )}
-          {recordingStopped && (
-            <button className="secondary" type="button" onClick={rerecord}>
-              <RotateCcw size={18} />
-              Re-record
-            </button>
-          )}
-          <span className={isRecording ? 'recording-dot active' : 'recording-dot'} />
-        </div>
-
-        <div className="transcript-panel live-transcript-block">
-          <span>Live transcript</span>
-          <p>{transcript || 'Transcript will appear here when browser speech recognition is available.'}</p>
-        </div>
-
-        {audioBlob && <p className="inline-status">Recording is ready to save.</p>}
-      </section>
-
-      {status && <p className="success">{status}</p>}
-      {error && <p className="error">{error}</p>}
-
-      <div className="action-row">
-        <button className="secondary" type="button" onClick={() => selectStep(Math.max(stepIndex - 1, 0))}>
-          Back
-        </button>
-        <button type="button" onClick={saveAndNext} disabled={loadingAction !== '' || !audioBlob}>
-          <Save size={18} />
-          {loadingAction === 'save' ? 'Saving...' : 'Save and Next'}
-        </button>
-      </div>
+      {renderRecorderControls('Save and Next', 'save', saveAndNext)}
 
       {hasAllResponses && (
-        <div className="form-panel completion-panel" style={{ marginTop: '24px', border: '1px solid #bbf7d0', background: '#f0fdf4' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '12px' }}>
-            <CheckCircle2 size={24} style={{ color: '#166534' }} />
-            <h3 style={{ color: '#166534', margin: 0, fontSize: '18px' }}>All Recordings Saved</h3>
+        <div className="form-panel completion-panel">
+          <div className="completion-heading">
+            <CheckCircle2 size={24} />
+            <h3>All Recordings Saved</h3>
           </div>
-          <p style={{ color: '#166534', margin: '0 0 16px 0', fontSize: '14px', lineHeight: '1.5' }}>
-            Please hand this device back to the doctor.
-          </p>
-          <div style={{ display: 'flex', gap: '12px' }}>
+          <p>Please hand this device back to the doctor.</p>
+          <div className="completion-actions">
             <button className="primary" type="button" onClick={() => navigate('/admin')}>
               Go to Dashboard
             </button>
@@ -646,33 +662,45 @@ export default function UserDashboard({ currentUser }) {
       )}
 
       {showCompletionModal && (
-        <div className="modal-overlay">
-          <div className="modal-content text-center">
-            <div style={{ display: 'inline-flex', padding: '16px', background: '#e9f8ef', borderRadius: '50%', color: '#166534', marginBottom: '16px' }}>
-              <CheckCircle2 size={40} />
-            </div>
-            <h2>Recordings Complete!</h2>
-            <p>
-              Thank you. All 4 recordings have been successfully saved.<br />
-              <strong>Please hand this device back to the doctor.</strong>
-            </p>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-              <button className="primary" type="button" onClick={() => navigate('/admin')} style={{ justifyContent: 'center' }}>
-                Go to Dashboard
-              </button>
-              <button className="secondary" type="button" onClick={() => {
-                setShowCompletionModal(false);
-                startNewPatient();
-              }} style={{ justifyContent: 'center' }}>
-                Record Another Patient
-              </button>
-              <button className="text-button" type="button" onClick={() => setShowCompletionModal(false)} style={{ color: '#5b6778', fontSize: '13px' }}>
-                Close
-              </button>
-            </div>
-          </div>
-        </div>
+        <CompletionModal
+          title="Recordings Complete!"
+          body={`All ${voiceQuestions.length} recordings have been successfully saved.`}
+          onClose={() => setShowCompletionModal(false)}
+          onAnother={() => {
+            setShowCompletionModal(false);
+            startNewPatient();
+          }}
+          navigate={navigate}
+        />
       )}
     </main>
+  );
+}
+
+function CompletionModal({ title, body, onClose, onAnother, navigate }) {
+  return (
+    <div className="modal-overlay">
+      <div className="modal-content text-center">
+        <div className="modal-badge">
+          <CheckCircle2 size={40} />
+        </div>
+        <h2>{title}</h2>
+        <p>
+          Thank you. {body}<br />
+          <strong>Please hand this device back to the doctor.</strong>
+        </p>
+        <div className="modal-actions">
+          <button className="primary" type="button" onClick={() => navigate('/admin')}>
+            Go to Dashboard
+          </button>
+          <button className="secondary" type="button" onClick={onAnother}>
+            Record Another Patient
+          </button>
+          <button className="text-button" type="button" onClick={onClose}>
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }

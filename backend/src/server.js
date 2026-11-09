@@ -38,6 +38,22 @@ app.get('/health', async (req, res) => {
 
 app.use((error, req, res, next) => {
   console.error(error);
+
+  // Multer upload errors carry a code but no HTTP status — map them so the
+  // client sees 413/400 instead of a generic 500.
+  if (error?.name === 'MulterError') {
+    const status = error.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+    return res.status(status).json({ message: error.message || 'File upload failed.' });
+  }
+
+  if (error?.name === 'CastError') {
+    return res.status(400).json({ message: 'Malformed identifier in request.' });
+  }
+
+  if (error?.type === 'entity.too.large') {
+    return res.status(413).json({ message: 'Request body is too large.' });
+  }
+
   res.status(error.status || 500).json({ message: error.message || 'Server error.' });
 });
 

@@ -18,6 +18,12 @@ async function signup(req, res, next) {
   try {
     const { name, email, password } = req.body;
     if (!name || !email || !password) return res.status(400).json({ message: 'Name, email, and password are required.' });
+    if (typeof password !== 'string' || password.length < 8) {
+      return res.status(400).json({ message: 'Password must be at least 8 characters long.' });
+    }
+    if (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      return res.status(400).json({ message: 'Please provide a valid email address.' });
+    }
 
     const existing = await User.findOne({ email });
 
@@ -72,16 +78,20 @@ async function login(req, res, next) {
 }
 
 /**
- * Decode a Google ID token (JWT) without external libraries.
+ * Verify a Google ID token (JWT) via Google's tokeninfo endpoint, which
+ * validates the token signature server-side. Decoding the payload locally is
+ * NOT sufficient: without signature verification anyone could forge a token
+ * for any email address.
  */
-function decodeGoogleIdToken(idToken) {
-  const parts = idToken.split('.');
-  if (parts.length !== 3) {
-    throw new Error('Invalid ID token format.');
+async function verifyGoogleIdToken(idToken) {
+  const response = await fetch(
+    `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`,
+    { signal: AbortSignal.timeout(10000) }
+  );
+  if (!response.ok) {
+    throw new Error(`Google rejected the credential (HTTP ${response.status}).`);
   }
-  const payloadBase64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-  const payloadJson = Buffer.from(payloadBase64, 'base64').toString('utf8');
-  return JSON.parse(payloadJson);
+  return response.json();
 }
 
 async function googleLogin(req, res, next) {
@@ -93,25 +103,23 @@ async function googleLogin(req, res, next) {
 
     let profile;
     try {
-      profile = decodeGoogleIdToken(credential);
-    } catch (decodeError) {
-      console.error('Google ID token decode error:', decodeError.message);
+      profile = await verifyGoogleIdToken(credential);
+    } catch (verifyError) {
+      console.error('Google ID token verification error:', verifyError.message);
       return res.status(401).json({ message: 'Invalid Google credential.' });
     }
 
-    // Verify the audience matches our client ID
+    // Defense in depth: re-check audience/expiry/issuer on the verified payload.
     if (profile.aud !== clientId) {
       console.error('Google aud mismatch:', { expected: clientId, got: profile.aud });
       return res.status(401).json({ message: 'Invalid Google credential: audience mismatch.' });
     }
 
-    // Verify the token has not expired
     const nowSeconds = Math.floor(Date.now() / 1000);
-    if (profile.exp && profile.exp < nowSeconds) {
+    if (profile.exp && Number(profile.exp) < nowSeconds) {
       return res.status(401).json({ message: 'Google credential has expired.' });
     }
 
-    // Verify issuer
     const validIssuers = ['accounts.google.com', 'https://accounts.google.com'];
     if (profile.iss && !validIssuers.includes(profile.iss)) {
       return res.status(401).json({ message: 'Invalid Google credential: issuer mismatch.' });

@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Submission = require('../models/Submission');
 const {
   buildOAuthConsentUrl,
@@ -71,12 +72,6 @@ function serializeSubmission(submission) {
   };
 }
 
-function getParticipantFileName(submission, extension) {
-  const participant = sanitizeFolderSegment(submission.user?.name || submission.userId || submission.sessionId);
-  const session = sanitizeFolderSegment(submission.sessionId || submission._id || 'session');
-  return `${participant}-${session}-final-report.${extension}`;
-}
-
 function getParticipantSessionPrefix(submission) {
   const participant = sanitizeFolderSegment(submission.user?.name || submission.userId || submission.sessionId);
   const session = sanitizeFolderSegment(submission.sessionId || submission._id || 'session');
@@ -106,11 +101,23 @@ async function existingProgressiveAudioEntries(submission) {
   }
 }
 
+// Restoring spectrograms requires downloading the whole Drive ZIP, which can
+// take a while. After a failed attempt, back off for a few minutes so report
+// views stay fast instead of re-attempting the download on every request.
+const RESTORE_RETRY_BACKOFF_MS = 3 * 60 * 1000;
+const restoreFailureTimestamps = new Map();
+
 async function restoreMissingSpectrogramsFromDriveZip(submission) {
   if (!submission.progressiveZipGoogleDriveFileId) return false;
   const responses = Array.from(submission.responses || []);
   const missing = responses.filter(([, response]) => !response?.spectrogram?.data);
   if (!missing.length) return false;
+
+  const submissionKey = String(submission._id || '');
+  const lastFailure = restoreFailureTimestamps.get(submissionKey);
+  if (lastFailure && Date.now() - lastFailure < RESTORE_RETRY_BACKOFF_MS) {
+    return false;
+  }
 
   try {
     const zipBuffer = await downloadFileFromDrive(submission.progressiveZipGoogleDriveFileId);
@@ -154,38 +161,13 @@ async function restoreMissingSpectrogramsFromDriveZip(submission) {
       }
     }
     if (restored) await submission.save();
+    if (submissionKey) restoreFailureTimestamps.delete(submissionKey);
     return restored;
   } catch (error) {
+    if (submissionKey) restoreFailureTimestamps.set(submissionKey, Date.now());
     console.warn('Unable to restore spectrograms from the Drive ZIP:', error.message);
     return false;
   }
-}
-
-async function buildFinalReportZip(submission, currentAudio) {
-  const structuredSubmission = buildStructuredSubmissionJson(submission);
-  const structuredJson = JSON.stringify(structuredSubmission, null, 2);
-  const zipFileName = getParticipantFileName(submission, 'zip');
-  const audioFiles = await existingProgressiveAudioEntries(submission);
-  if (currentAudio?.questionId && currentAudio.buffer) {
-    const currentName = `audios/${currentAudio.questionId}.wav`;
-    const existingIndex = audioFiles.findIndex((entry) => entry.name === currentName);
-    const currentEntry = { name: currentName, content: currentAudio.buffer };
-    if (existingIndex >= 0) audioFiles[existingIndex] = currentEntry;
-    else audioFiles.push(currentEntry);
-  }
-  const zipEntries = [
-    {
-      name: 'final-report.json',
-      content: structuredJson,
-    },
-    ...audioFiles,
-  ];
-  const zipBuffer = createZip([
-    ...zipEntries,
-  ]);
-  console.log(`Built ZIP ${zipFileName} with entries: ${zipEntries.map((entry) => entry.name).join(', ')}`);
-
-  return { structuredSubmission, structuredJson, zipFileName, zipBuffer, zipEntries: zipEntries.map((entry) => entry.name) };
 }
 
 async function buildProgressiveAudioZip(submission, currentAudio) {
@@ -381,8 +363,15 @@ async function uploadProgressiveAudioZipToDrive(submission, zipBuffer, zipFileNa
     submission.progressiveZipFileUrl = driveFile.webViewLink || driveFile.webContentLink;
     submission.progressiveZipUploadError = undefined;
     try {
+      // Only trash stale duplicates of THIS session (matched by name prefix).
+      // Other sessions' archives in the folder are never touched.
+      const sessionPrefixes = [
+        getParticipantSessionPrefix(submission),
+        sanitizeFolderSegment(submission.sessionId),
+      ];
       const trashedFiles = await cleanupAudioCollectionFolder({
         keepFileIds: [driveFile.id],
+        keepPrefixes: sessionPrefixes,
       });
       cleanupResult.cleanedFiles = trashedFiles.map((file) => file.name);
       if (trashedFiles.length) {
@@ -690,7 +679,11 @@ async function clearEnrollment(req, res, next) {
 async function generateReport(req, res, next) {
   try {
     const { sessionId, submissionId } = req.body;
+    if (submissionId && !mongoose.Types.ObjectId.isValid(submissionId)) {
+      return res.status(400).json({ message: 'submissionId is not a valid identifier.' });
+    }
     const query = submissionId ? { _id: submissionId } : { sessionId };
+    if (!query._id && !query.sessionId) return res.status(400).json({ message: 'submissionId or sessionId is required.' });
     if (req.user?.role !== 'admin') query.userId = req.user?._id?.toString();
     const submission = await Submission.findOne(query);
     if (!submission) return res.status(404).json({ message: 'Submission not found.' });
@@ -742,6 +735,9 @@ async function generateReport(req, res, next) {
 
 async function getReport(req, res, next) {
   try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(404).json({ message: 'Submission not found.' });
+    }
     const query = { _id: req.params.id };
     if (req.user?.role !== 'admin') query.userId = req.user?._id?.toString();
     const submission = await Submission.findOne(query);

@@ -8,10 +8,17 @@ function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
 }
 
 function verifyPassword(password, storedHash = '') {
-  const [salt, hash] = storedHash.split(':');
+  const [salt, hash] = String(storedHash).split(':');
   if (!salt || !hash) return false;
-  const candidate = hashPassword(password, salt).split(':')[1];
-  return crypto.timingSafeEqual(Buffer.from(candidate, 'hex'), Buffer.from(hash, 'hex'));
+  try {
+    const candidate = hashPassword(password, salt).split(':')[1];
+    const candidateBuffer = Buffer.from(candidate, 'hex');
+    const storedBuffer = Buffer.from(hash, 'hex');
+    if (candidateBuffer.length !== storedBuffer.length) return false;
+    return crypto.timingSafeEqual(candidateBuffer, storedBuffer);
+  } catch {
+    return false;
+  }
 }
 
 function base64Url(input) {
@@ -26,13 +33,25 @@ function signToken(payload) {
 }
 
 function verifyToken(token) {
-  const [header, body, signature] = String(token || '').split('.');
-  if (!header || !body || !signature) return null;
-  const expected = crypto.createHmac('sha256', TOKEN_SECRET()).update(`${header}.${body}`).digest('base64url');
-  if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
-  const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
-  if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) return null;
-  return payload;
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length !== 3) return null;
+    const [header, body, signature] = parts;
+
+    const expected = crypto.createHmac('sha256', TOKEN_SECRET()).update(`${header}.${body}`).digest('base64url');
+    const signatureBuffer = Buffer.from(signature);
+    const expectedBuffer = Buffer.from(expected);
+    // timingSafeEqual throws when lengths differ, so compare sizes first.
+    if (signatureBuffer.length !== expectedBuffer.length) return null;
+    if (!crypto.timingSafeEqual(signatureBuffer, expectedBuffer)) return null;
+
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    if (!payload || typeof payload !== 'object' || !payload.id) return null;
+    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch {
+    return null;
+  }
 }
 
 module.exports = {

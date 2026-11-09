@@ -1,5 +1,5 @@
 """Local FastAPI inference service for the SchNet, linguistic v11, and fusion models."""
-import os, pickle, re, traceback
+import base64, io, os, pickle, re, traceback
 from pathlib import Path
 from typing import List, Optional
 
@@ -103,7 +103,8 @@ class FusionMLP(nn.Module):
     def forward(self,x): h=self.net(x); return self.cls_head(h).squeeze(1),self.reg_head(h).squeeze(1)
 
 class Pair(BaseModel): question_id: str; prompt: str; response: str
-class Request(BaseModel): prompt_responses: List[Pair] = Field(min_length=1); audio_paths: List[str] = []
+class AudioPayload(BaseModel): filename: str; data_base64: str
+class Request(BaseModel): prompt_responses: List[Pair] = Field(min_length=1); audio_paths: List[str] = []; audio_files: List[AudioPayload] = []
 app=FastAPI(title='Fusion Inference Service'); state={}
 def artifact(name):
     local=MODELS/name; return local if local.exists() else ROOT/name
@@ -126,25 +127,52 @@ def embed(text):
         chunk=[tok.cls_token_id]+ids[start:start+510]+[tok.sep_token_id]; pad=[tok.pad_token_id or 0]*(512-len(chunk)); out=state['bert'](input_ids=torch.tensor([chunk+pad],device=DEVICE),attention_mask=torch.tensor([[1]*len(chunk)+[0]*len(pad)],device=DEVICE)); chunks.append(out.last_hidden_state[0,0].cpu().numpy())
         if start+510>=len(ids): break
     return np.mean(chunks,0).astype(np.float32)
-def schnet_prob(paths):
+def _wav_from_buffer(raw_bytes):
+    """Decode audio bytes (WAV/FLAC/OGG) into a mono 16 kHz tensor."""
+    data, sr = sf.read(io.BytesIO(raw_bytes), dtype='float32')
+    wav = torch.from_numpy(data)
+    if wav.dim() == 1:
+        wav = wav.unsqueeze(0)
+    else:
+        wav = wav.T.mean(0, keepdim=True)
+    if sr != 16000:
+        wav = T.Resample(sr, 16000)(wav)
+    return wav
+
+def _wav_from_path(p):
+    """Decode audio from a local file path into a mono 16 kHz tensor."""
+    data, sr = sf.read(p, dtype='float32')
+    wav = torch.from_numpy(data)
+    if wav.dim() == 1:
+        wav = wav.unsqueeze(0)
+    else:
+        wav = wav.T.mean(0, keepdim=True)
+    if sr != 16000:
+        wav = T.Resample(sr, 16000)(wav)
+    return wav
+
+def _schnet_logits_from_wav(wav):
+    """Run SchNet on a single mono waveform tensor and return logits."""
+    length = 480000
+    starts = [0] if wav.shape[1] <= length else np.linspace(0, wav.shape[1] - length, 5, dtype=int)
+    logits = []
+    for start in starts:
+        piece = wav[:, start:start+length]
+        piece = F.pad(piece, (0, max(0, length - piece.shape[1])))
+        logits.append(state['schnet'](piece.to(DEVICE)).item())
+    return logits
+
+def schnet_prob(paths=None, audio_files=None):
     logits=[]
-    for p in paths:
-        # Use soundfile instead of torchaudio.load to avoid torchcodec/FFmpeg dependency
-        data, sr = sf.read(p, dtype='float32')
-        wav = torch.from_numpy(data)
-        if wav.dim() == 1:
-            wav = wav.unsqueeze(0)          # mono: (samples,) -> (1, samples)
-        else:
-            wav = wav.T                      # multi-ch: (samples, ch) -> (ch, samples)
-            wav = wav.mean(0, keepdim=True)  # mix down to mono
-        if sr != 16000:
-            wav = T.Resample(sr, 16000)(wav)
-        length = 480000
-        starts = [0] if wav.shape[1] <= length else np.linspace(0, wav.shape[1] - length, 5, dtype=int)
-        for start in starts:
-            piece = wav[:, start:start+length]
-            piece = F.pad(piece, (0, max(0, length - piece.shape[1])))
-            logits.append(state['schnet'](piece.to(DEVICE)).item())
+    # Prefer base64 payloads (works across machines); fall back to local paths.
+    if audio_files:
+        for item in audio_files:
+            wav = _wav_from_buffer(base64.b64decode(item.data_base64))
+            logits.extend(_schnet_logits_from_wav(wav))
+    elif paths:
+        for p in paths:
+            wav = _wav_from_path(p)
+            logits.extend(_schnet_logits_from_wav(wav))
     return None if not logits else float(torch.sigmoid(torch.tensor(np.mean(logits))).item())
 @app.post('/predict')
 def predict(req: Request):
@@ -169,7 +197,7 @@ def predict(req: Request):
         ling_p = float(ling['platt_calibrator'].predict_proba([[raw]])[0, 1])
 
         # --- Audio model (SchNet) ---
-        sch_p = schnet_prob(req.audio_paths)
+        sch_p = schnet_prob(paths=req.audio_paths or None, audio_files=req.audio_files or None)
         if sch_p is None:
             raise HTTPException(422, 'No readable audio files were supplied; fusion requires both modalities.')
 

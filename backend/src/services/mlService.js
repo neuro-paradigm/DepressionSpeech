@@ -235,8 +235,12 @@ function orderedResponseEntries(submission) {
 
 function buildCombinedTranscript(submission) {
   return orderedResponses(submission)
-    .map((response, index) => {
-      const label = response.questionId === 'session' ? 'Entire Session' : `Question ${index + 1}`;
+    .map((response) => {
+      // Label from the actual questionId — using the array index mislabels
+      // questions whenever earlier responses are missing.
+      const label = response.questionId === 'session'
+        ? 'Entire Session'
+        : `Question ${String(response.questionId || '').replace(/^q/, '') || '?'}`;
       return `${label}: ${response.question}\nTranscript: ${response.transcripts?.normalized || response.transcripts?.raw || ''}`;
     })
     .join('\n\n');

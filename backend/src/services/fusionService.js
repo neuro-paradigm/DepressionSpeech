@@ -1,6 +1,3 @@
-const fs = require('fs/promises');
-const os = require('os');
-const path = require('path');
 const { downloadFileFromDrive } = require('./googleDriveService');
 const { extractZipEntries } = require('./zipService');
 
@@ -22,7 +19,7 @@ function buildPromptResponses(submission) {
   }));
 }
 
-async function getAudioFiles(submission, folder) {
+async function getAudioPayloads(submission) {
   if (!submission.progressiveZipGoogleDriveFileId) {
     throw new Error('No ZIP file found on Google Drive. Audio upload must succeed before running inference.');
   }
@@ -32,9 +29,7 @@ async function getAudioFiles(submission, folder) {
   for (const { questionId } of responseEntries(submission)) {
     const audio = entries.get(`audios/${questionId}.wav`) || entries.get(`${questionId}.wav`);
     if (!audio) continue;
-    const filePath = path.join(folder, `${questionId}.wav`);
-    await fs.writeFile(filePath, audio);
-    result.push(filePath);
+    result.push({ filename: `${questionId}.wav`, data_base64: Buffer.from(audio).toString('base64') });
   }
   if (result.length === 0) {
     throw new Error('ZIP file downloaded, but no audio tracks were found inside it.');
@@ -43,25 +38,20 @@ async function getAudioFiles(submission, folder) {
 }
 
 async function predictFusion(submission) {
-  const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'audio-fusion-'));
-  try {
-    const promptResponses = buildPromptResponses(submission);
-    if (!promptResponses.some((item) => item.response.trim())) {
-      throw new Error('No transcript is available for fusion inference.');
-    }
-    const audioPaths = await getAudioFiles(submission, folder);
-    const response = await fetch(`${serviceUrl()}/predict`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ prompt_responses: promptResponses, audio_paths: audioPaths }),
-      signal: AbortSignal.timeout(Number(process.env.FUSION_SERVICE_TIMEOUT_MS || 120000)),
-    });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(body.detail || `Fusion service returned HTTP ${response.status}.`);
-    return body;
-  } finally {
-    await fs.rm(folder, { recursive: true, force: true });
+  const promptResponses = buildPromptResponses(submission);
+  if (!promptResponses.some((item) => item.response.trim())) {
+    throw new Error('No transcript is available for fusion inference.');
   }
+  const audioFiles = await getAudioPayloads(submission);
+  const response = await fetch(`${serviceUrl()}/predict`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt_responses: promptResponses, audio_files: audioFiles }),
+    signal: AbortSignal.timeout(Number(process.env.FUSION_SERVICE_TIMEOUT_MS || 120000)),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.detail || `Fusion service returned HTTP ${response.status}.`);
+  return body;
 }
 
 async function getFusionHealth() {

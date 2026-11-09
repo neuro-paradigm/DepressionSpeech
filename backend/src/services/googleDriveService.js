@@ -220,25 +220,38 @@ function saveRefreshTokenToEnv(refreshToken) {
 
 async function getAccessToken() {
   const { clientId, clientSecret } = getOAuthConfig();
-  try {
-    const oauthToken = await getOAuthAccessToken();
-    if (oauthToken) return oauthToken;
-  } catch (oauthError) {
-    const error = new Error(`${oauthError.message} Re-authorize Google Drive at http://localhost:5000/api/google-drive/auth, then restart the backend.`);
-    error.status = oauthError.status || 503;
-    throw error;
+
+  // 1) Preferred: OAuth refresh token.
+  const refreshToken = (process.env.GOOGLE_DRIVE_REFRESH_TOKEN || '').trim();
+  if (refreshToken) {
+    try {
+      const oauthToken = await getOAuthAccessToken();
+      if (oauthToken) return oauthToken;
+    } catch (oauthError) {
+      const error = new Error(`${oauthError.message} Re-authorize Google Drive at http://localhost:5000/api/google-drive/auth, then restart the backend.`);
+      error.status = oauthError.status || 503;
+      throw error;
+    }
   }
 
+  // 2) Fallback: direct access token.
+  const directToken = (process.env.GOOGLE_DRIVE_ACCESS_TOKEN || '').trim();
+  if (directToken) return directToken;
+
+  // 3) Fallback: service account.
+  const serviceAccountToken = await getServiceAccountAccessToken().catch(() => null);
+  if (serviceAccountToken) return serviceAccountToken;
+
+  // Nothing worked — explain how to configure access.
   if (clientId && clientSecret) {
     const error = new Error('Google Drive OAuth is configured but not authorized yet. Open http://localhost:5000/api/google-drive/auth, approve access, then restart the backend.');
     error.status = 503;
     throw error;
   }
 
-  const directToken = (process.env.GOOGLE_DRIVE_ACCESS_TOKEN || '').trim();
-  if (directToken) return directToken;
-
-  return getServiceAccountAccessToken();
+  const error = new Error('Google Drive is not configured. Provide a refresh token, access token, or service account credentials.');
+  error.status = 503;
+  throw error;
 }
 
 async function uploadFileToDrive({
@@ -385,11 +398,17 @@ async function trashFiles(files, accessToken) {
 
 async function cleanupAudioCollectionFolder({
   keepFileIds = [],
+  keepPrefixes = [],
   folderId = process.env.GOOGLE_DRIVE_FOLDER_ID || DEFAULT_DRIVE_FOLDER_ID,
 }) {
   const accessToken = await getAccessToken();
   const targetFolderId = normalizeDriveFolderId(folderId);
   if (!accessToken || !targetFolderId) return [];
+
+  // Safety: without explicit prefixes nothing is ever trashed. This cleanup
+  // only removes stale duplicates of the CURRENT session (same name prefix);
+  // archives belonging to other sessions must never be touched.
+  if (!keepPrefixes.length) return [];
 
   const query = `'${targetFolderId}' in parents and trashed = false`;
   const searchUrl = new URL('https://www.googleapis.com/drive/v3/files');
@@ -407,8 +426,11 @@ async function cleanupAudioCollectionFolder({
   }
 
   const keepIds = new Set(keepFileIds.filter(Boolean));
+  const prefixes = keepPrefixes.filter(Boolean);
   const filesToTrash = (searchPayload.files || []).filter((file) => {
     if (keepIds.has(file.id)) return false;
+    const matchesSession = prefixes.some((prefix) => file.name.startsWith(prefix));
+    if (!matchesSession) return false;
     return /\.wav$/i.test(file.name)
       || /\.zip$/i.test(file.name)
       || /^audio\//i.test(file.mimeType || '')

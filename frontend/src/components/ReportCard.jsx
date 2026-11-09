@@ -1,4 +1,5 @@
 import { AlertTriangle, FileText } from 'lucide-react';
+import { classificationTone, displayClassification } from '../utils/display';
 
 const BIOMARKER_ORDER = [
   'type_token_ratio',
@@ -60,13 +61,6 @@ function formatValue(value) {
   return Number(value || 0).toFixed(4);
 }
 
-function displayClassification(value) {
-  if (!value) return 'Not available';
-  if (value === 'CONTROL') return 'TYPICAL SPEECH PATTERN';
-  if (value.includes('LIKE SPEECH PATTERN')) return 'ATYPICAL SPEECH PATTERN';
-  return value;
-}
-
 function spectrogramSrc(spectrogram) {
   if (!spectrogram?.data) return '';
   if (spectrogram.encoding === 'base64') return `data:${spectrogram.mimeType || 'image/svg+xml'};base64,${spectrogram.data}`;
@@ -108,8 +102,8 @@ function BiomarkerTable({ biomarkers, label = 'Feature summary', order = BIOMARK
 function FindingList({ items }) {
   return (
     <ul className="clinical-list">
-      {(items || []).map((item) => (
-        <li key={item}>{item}</li>
+      {(items || []).map((item, index) => (
+        <li key={`${index}-${item}`}>{item}</li>
       ))}
     </ul>
   );
@@ -140,28 +134,30 @@ export default function ReportCard({
     ? report.spectrogram
     : primarySpectrogramResponse?.spectrogram;
   const fusion = report.fusionPrediction;
+  const classificationDisplay = displayClassification(report.classification);
 
   return (
     <article className="report clinical-report">
       <header className="clinical-header">
         <h1>PATIENT SPEECH ANALYSIS REPORT</h1>
+        <span className={`classification-badge tone-${classificationTone(report.classification)}`}>
+          {classificationDisplay}
+        </span>
       </header>
 
       <section className="clinical-summary">
         <div><span>Participant</span><strong>{user?.name || 'Unassigned session'}</strong></div>
         <div><span>File</span><strong>{report.fileName || 'combined-transcript.txt'}</strong></div>
-        <div><span>Classification</span><strong>{displayClassification(report.classification)}</strong></div>
         <div><span>Based on</span><strong>{report.basedOn || 'upto_q3'}</strong></div>
         <div><span>Confidence</span><strong>{report.confidenceLevel || 'Low'}</strong></div>
         <div><span>Speech score</span><strong>{Number(report.probabilitySchizophrenia || 0).toFixed(4)}</strong></div>
-        <div><span>Decision threshold</span><strong>{Number(report.decisionThreshold || 0).toFixed(4)}</strong></div>
-        <div><span>Uncertain margin</span><strong>{Number(report.uncertaintyMargin || 0).toFixed(4)}</strong></div>
+        <div><span>Threshold / margin</span><strong>{Number(report.decisionThreshold || 0).toFixed(2)} ± {Number(report.uncertaintyMargin || 0).toFixed(2)}</strong></div>
       </section>
 
       {report.finalSummary && (
         <section className="report-section">
           <h2>Final Summary</h2>
-          <p className="overall-impression">{report.finalSummary}</p>
+          <p className="overall-impression lead-paragraph">{report.finalSummary}</p>
         </section>
       )}
 
@@ -226,8 +222,8 @@ export default function ReportCard({
         <div>
           <h2>4. Clinical Interpretation</h2>
           <div className="interpretation-list">
-            {(report.clinicalInterpretation || []).map((item) => (
-              <div key={`${item.biomarker}-${item.text}`} className="interpretation-item">
+            {(report.clinicalInterpretation || []).map((item, index) => (
+              <div key={`${index}-${item.biomarker}`} className="interpretation-item">
                 <AlertTriangle size={18} />
                 <p><strong>[{item.biomarker}]</strong> {item.text}</p>
               </div>
@@ -244,7 +240,9 @@ export default function ReportCard({
         <h2>Transcript</h2>
         <div className="combined-transcript">
           <span>Stored transcript</span>
-          <p>{combinedTranscript || 'No transcript was stored for this report.'}</p>
+          {combinedTranscript
+            ? <p className="transcript-body">{combinedTranscript}</p>
+            : <p>No transcript was stored for this report.</p>}
         </div>
         {combinedTranscriptUrl && <a className="icon-link transcript-download" href={combinedTranscriptUrl} target="_blank" rel="noreferrer"><FileText size={16} />Open transcript file</a>}
         {zipUploadError && <p className="inline-status">Drive ZIP upload status: {zipUploadError}</p>}
