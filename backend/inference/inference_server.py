@@ -1,7 +1,7 @@
 """Local FastAPI inference service for the SchNet, linguistic v11, and fusion models."""
 import base64, io, os, pickle, re, traceback
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import soundfile as sf
@@ -39,7 +39,6 @@ def turn_ttr(text):
     words = word_tokens(text); return len(set(words)) / max(len(words), 1)
 def turn_filler_ratio(text):
     words = word_tokens(text); return sum(w in DISFLUENCY for w in words) / max(len(words), 1)
-def approx_syllables(word): return max(1, len(re.findall(r'[aeiouy]+', word.lower())))
 def linreg_slope(values):
     return float(np.polyfit(np.arange(len(values)), values, 1)[0]) if len(values) > 1 else 0.0
 def is_open_question(text):
@@ -110,7 +109,8 @@ def artifact(name):
     local=MODELS/name; return local if local.exists() else ROOT/name
 @app.on_event('startup')
 def load_models():
-    fusion=pickle.load(open(artifact('fusion_model_v1.pkl'),'rb')); ling=pickle.load(open(artifact('depression_model_v11.pkl'),'rb'))
+    with open(artifact('fusion_model_v1.pkl'), 'rb') as f: fusion = pickle.load(f)
+    with open(artifact('depression_model_v11.pkl'), 'rb') as f: ling = pickle.load(f)
     sch=SchNet().to(DEVICE); sch.load_state_dict(torch.load(artifact('fold_1_schnet.pth'),map_location=DEVICE),strict=False); sch.eval()
     fm=FusionMLP().to(DEVICE); fm.load_state_dict(fusion['fusion_mlp_state']); fm.eval()
     bert_dir = BERT_MODEL_DIR if BERT_MODEL_DIR.exists() else MODELS / 'bioclinical_bert'
@@ -151,6 +151,7 @@ def _wav_from_path(p):
         wav = T.Resample(sr, 16000)(wav)
     return wav
 
+@torch.no_grad()
 def _schnet_logits_from_wav(wav):
     """Run SchNet on a single mono waveform tensor and return logits."""
     length = 480000
